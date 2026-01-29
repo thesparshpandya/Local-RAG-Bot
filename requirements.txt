@@ -1,7 +1,10 @@
 langchain
 langchain-community
+langchain-core
+langchain-text-splitters
 langchain-huggingface
 langchain-ollama
 faiss-cpu
 unstructured[all-docs]
 sentence-transformers
+numpy<2.0

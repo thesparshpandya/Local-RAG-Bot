@@ -6,7 +6,8 @@ from langchain_community.document_loaders import UnstructuredFileLoader, Directo
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+# UPDATED IMPORT BELOW:
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 
 # --- CONFIGURATION ---
@@ -23,7 +24,7 @@ def main():
     print("🤖 Initializing Local RAG Chatbot...")
     
     # 2. Load Documents
-    print(f"📂 Loading documents from '{DOCS_FOLDER}'...")
+    print(f"Loading documents from '{DOCS_FOLDER}'...")
     try:
         # DirectoryLoader scans the folder. We use Unstructured to handle mixed file types.
         loader = DirectoryLoader(DOCS_FOLDER, loader_cls=UnstructuredFileLoader)
@@ -40,7 +41,7 @@ def main():
     print(f"   -> Created {len(chunks)} chunks of text.")
 
     # 4. Create Vector Index (Embeddings)
-    print("Creating vector index (loading embedding model)...")
+    print("🧠 Creating vector index (loading embedding model)...")
     try:
         embeddings = HuggingFaceEmbeddings(
             model_name="BAAI/bge-small-en-v1.5",
@@ -99,7 +100,7 @@ def main():
             print("-" * 50)
 
         except KeyboardInterrupt:
-            print("\n👋 Goodbye!")
+            print("\nGoodbye!")
             break
         except Exception as e:
             print(f"Error: {e}")
