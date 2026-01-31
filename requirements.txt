@@ -1,9 +1,12 @@
-langchain
-langchain-community
-langchain-core
-langchain-text-splitters
-langchain-huggingface
-langchain-ollama
+# Locking to Stable v0.3 series to prevent v1.0 breaking changes
+langchain>=0.3.0,<1.0.0
+langchain-community>=0.3.0,<1.0.0
+langchain-core>=0.3.0,<1.0.0
+langchain-text-splitters>=0.3.0,<1.0.0
+langchain-huggingface>=0.1.0
+langchain-ollama>=0.2.0
+
+# Supporting libraries
 faiss-cpu
 unstructured[all-docs]
 sentence-transformers
