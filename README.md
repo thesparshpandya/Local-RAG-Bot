@@ -40,7 +40,7 @@ ollama pull mistral
 
 1. **Clone the repository:**
 ```bash
-git clone https://github.com/yourusername/Local-RAG-Bot.git
+git clone https://github.com/thesparshpandya/Local-RAG-Bot.git
 cd Local-RAG-Bot
 
 ```
