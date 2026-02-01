@@ -6,18 +6,18 @@ This project runs entirely on your local machine using **Ollama** and **LangChai
 
 ## Key Features
 
-* **100% Local & Private:** Uses local LLMs (Mistral) via Ollama; no API keys or cloud costs required.
-* **PDF Support:** robust parsing using `PyPDFLoader` to handle text extraction reliably.
-* **Source Citations:** Every answer includes the exact filename and page number where the information was found.
-* **Vector Search:** Uses FAISS and HuggingFace embeddings for semantic search (finding meaning, not just keywords).
-* **Fact-Focused:** Tuned for low temperature (0.1) to reduce hallucinations and stick strictly to the provided context.
+* **100% Local & Private:** Uses local LLMs (Mistral/Llama3) via Ollama; no API keys or cloud costs required.
+* **Smart Sync & Persistence:** Automatically saves the vector index to disk (`faiss_index`). Subsequent runs load **instantly** (<1s) unless you add/remove files.
+* **Expert Analysis:** Uses a tuned "Expert Persona" prompt to provide detailed explanations rather than just retrieving raw text.
+* **Deep Context:** Scans the top 10 relevant document chunks with optimized slicing (1200 characters) to capture full paragraphs and context.
+* **Cross-Platform:** Optimized file handling for macOS, Windows, and Linux.
 
 ## Tech Stack
 
 * **Language:** Python 3.11 (Pinned for stability)
 * **Orchestration:** LangChain (v0.3 Stable Architecture)
-* **LLM Engine:** Ollama (running Mistral)
-* **Vector Database:** FAISS (CPU version)
+* **LLM Engine:** Ollama (Mistral or Llama3)
+* **Vector Database:** FAISS (CPU version) with local persistence
 * **Embeddings:** `BAAI/bge-small-en-v1.5` (HuggingFace)
 
 ## Prerequisites
@@ -47,15 +47,14 @@ cd Local-RAG-Bot
 
 
 2. **Create a Virtual Environment (Recommended):**
-It is best to use a fresh environment to avoid conflicts.
 ```bash
-/opt/homebrew/bin/python3.11 -m venv venv
+python3.11 -m venv venv
 source venv/bin/activate
+# On Windows use: venv\Scripts\activate
 
 ```
 
 
-*(Note: Adjust the python path if your installation is located elsewhere)*
 3. **Install Dependencies:**
 ```bash
 pip install -r requirements.txt
@@ -68,15 +67,6 @@ pip install -r requirements.txt
 
 1. **Prepare your documents:**
 Create a folder named `source_docs` in the project root and place your PDF files inside.
-```text
-Local-RAG-Bot/
-├── source_docs/
-│   ├── manual.pdf
-│   └── report.pdf
-
-```
-
-
 2. **Run the Bot:**
 ```bash
 python3 rag_bot.py
@@ -85,17 +75,22 @@ python3 rag_bot.py
 
 
 3. **Chat:**
-The bot will index your documents (this happens once per run) and then prompt you for input. Type your question and hit Enter. Type `exit` to quit.
+* **First Run:** The bot will analyze your PDFs and create a local index (takes ~30-60s depending on file size).
+* **Subsequent Runs:** The bot will load the saved index **instantly**.
+* **Updating Files:** If you add or remove PDFs, the bot detects the change automatically and rebuilds the index.
+
+
 
 ## Project Structure
 
-* `rag_bot.py`: The main application logic. Handles document loading, splitting, embedding, and the chat loop.
-* `requirements.txt`: List of all Python dependencies pinned to stable versions.
+* `rag_bot.py`: The main application logic. Handles document loading, splitting, persistence, and the chat loop.
 * `source_docs/`: Directory where you store the PDFs you want to chat with.
-* `.gitignore`: Specifies files that should be ignored by Git (like the `venv` folder and `.DS_Store`).
+* `faiss_index/`: (Generated) Stores the vector database locally for speed.
+* `requirements.txt`: List of all Python dependencies pinned to stable versions.
+* `.gitignore`: Ensures system files and large databases are not uploaded to GitHub.
 
 ## Troubleshooting
 
-* **"Model not found":** Ensure you have the Ollama app running in the background and that you have run `ollama pull mistral`.
-* **"Folder is empty":** Make sure you created the `source_docs` folder and added at least one PDF file.
-* **Slow performance:** The first time you run a query, the system might be slow as it loads the embedding model into memory. Subsequent queries will be faster. Performance depends on your hardware (CPU/RAM).
+* **"Model not found":** Ensure you have the Ollama app running in the background.
+* **"Index mismatch":** If the bot behaves unexpectedly, you can manually delete the `faiss_index` folder to force a fresh rebuild.
+* **PDF Errors:** If a file fails to load, ensure it is a valid PDF (not an empty file or HTML error page) by opening it in a standard PDF viewer first.
