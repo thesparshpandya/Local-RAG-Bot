@@ -1,158 +1,224 @@
 import os
-import json
+import sys
+import time
+import warnings
+from typing import List
 
-# --- Standard LangChain Imports ---
-from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
+# Filter warnings to keep terminal clean
+warnings.filterwarnings("ignore")
+
+# --- Rich Text Imports (For structured terminal output) ---
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    from rich.prompt import Prompt
+    from rich.status import Status
+    console = Console()
+except ImportError:
+    # Fallback if rich is not installed
+    print("Tip: Install 'rich' for a better CLI experience (pip install rich)")
+    class Console:
+        def print(self, *args, **kwargs): print(*args)
+        def rule(self, *args): print("-" * 50)
+        def clear(self): os.system('cls' if os.name == 'nt' else 'clear')
+    class Markdown:
+        def __init__(self, text): self.text = text
+        def __str__(self): return self.text
+    class Panel:
+        def __init__(self, renderable, title="", **kwargs): self.renderable = renderable
+    class Prompt:
+        @staticmethod
+        def ask(text, default=""): return input(f"{text} [{default}]: ") or default
+    class Status:
+        def __init__(self, text): print(f"[{text}]...")
+        def __enter__(self): pass
+        def __exit__(self, exc_type, exc_val, exc_tb): pass
+    console = Console()
+
+# --- LangChain & AI Imports ---
+from langchain_community.document_loaders import UnstructuredFileLoader
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains.retrieval import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate
 
 # --- CONFIGURATION ---
-DOCS_FOLDER = "source_docs"
-INDEX_FOLDER = "faiss_index"
-METADATA_FILE = os.path.join(INDEX_FOLDER, "metadata.json")
-MODEL_NAME = "mistral" 
+MODEL_NAME = "mistral"  # LLM Model Name
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+BASE_URL = "http://localhost:11434"
 
-# --- SILENCE WARNINGS (Clean Output) ---
-os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-import logging
-logging.getLogger("transformers").setLevel(logging.ERROR)
-
-def get_embeddings():
-    return HuggingFaceEmbeddings(
-        model_name="BAAI/bge-small-en-v1.5",
-        encode_kwargs={'normalize_embeddings': True}
-    )
-
-def get_current_files():
-    if not os.path.exists(DOCS_FOLDER):
-        return []
-    return sorted([f for f in os.listdir(DOCS_FOLDER) if f.endswith('.pdf')])
-
-def create_or_load_vector_store():
-    embeddings = get_embeddings()
-    current_files = get_current_files()
+def get_files_from_directory(path: str) -> List[str]:
+    """Scans a directory for supported document files."""
+    supported_exts = ['.pdf', '.docx', '.pptx', '.txt']
+    files = []
     
-    if not current_files:
-        print(f"Error: No PDF files found in '{DOCS_FOLDER}'.")
+    # Handle single file path
+    if os.path.isfile(path):
+        return [path]
+    
+    # Handle directory path
+    for root, _, filenames in os.walk(path):
+        for filename in filenames:
+            if any(filename.lower().endswith(ext) for ext in supported_exts):
+                files.append(os.path.join(root, filename))
+    return files
+
+def process_documents(file_paths: List[str]):
+    """
+    Loads, splits, and embeds documents.
+    Uses 'strategy=auto' to handle both text PDFs and scanned images (OCR).
+    """
+    all_docs = []
+    
+    # 1. Load Documents
+    with console.status("[bold green]Reading documents...[/bold green]") as status:
+        for i, file_path in enumerate(file_paths):
+            console.print(f"[dim]Processing: {os.path.basename(file_path)}[/dim]")
+            try:
+                # strategy="auto" detects if OCR (Tesseract) is needed
+                loader = UnstructuredFileLoader(file_path, strategy="auto")
+                docs = loader.load()
+                all_docs.extend(docs)
+            except Exception as e:
+                console.print(f"[bold red]Error loading {os.path.basename(file_path)}: {e}[/bold red]")
+
+    if not all_docs:
+        console.print("[bold red]No documents were successfully loaded.[/bold red]")
         return None
 
-    # Smart Sync Check
-    if os.path.exists(INDEX_FOLDER) and os.path.exists(METADATA_FILE):
-        try:
-            with open(METADATA_FILE, "r") as f:
-                indexed_files = json.load(f)
-            
-            if indexed_files == current_files:
-                print("Loading existing index (No changes detected)...")
-                vector_store = FAISS.load_local(
-                    INDEX_FOLDER, 
-                    embeddings, 
-                    allow_dangerous_deserialization=True
-                )
-                return vector_store
-            else:
-                print("Changes detected in file list. Updating index...")
-        except Exception:
-            print("Index mismatch. Rebuilding...")
+    # 2. Split Text
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        separators=["\n\n", "\n", " ", ""]
+    )
+    chunks = text_splitter.split_documents(all_docs)
+    console.print(f"[blue]Created {len(chunks)} text chunks.[/blue]")
 
-    # Rebuild Index with LARGER CHUNKS for better context
-    print(f"Loading documents from '{DOCS_FOLDER}'...")
-    loader = DirectoryLoader(DOCS_FOLDER, glob="*.pdf", loader_cls=PyPDFLoader)
-    documents = loader.load()
+    # 3. Create Vector Store
+    with console.status("[bold green]Creating Vector Database (Embeddings)...[/bold green]"):
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            encode_kwargs={'normalize_embeddings': True}
+        )
+        vector_store = FAISS.from_documents(chunks, embeddings)
     
-    print("Splitting text (Optimized for Context)...")
-    # FIX 1: Increased chunk size to 1200 to capture full paragraphs
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=300)
-    chunks = text_splitter.split_documents(documents)
-    
-    print("Creating vector index...")
-    vector_store = FAISS.from_documents(chunks, embeddings)
-    
-    vector_store.save_local(INDEX_FOLDER)
-    with open(METADATA_FILE, "w") as f:
-        json.dump(current_files, f)
-        
-    print("Index saved successfully.")
     return vector_store
 
-def get_rag_chain(vector_store):
-    # FIX 2: Temperature 0.2 allows for better synthesis without hallucinations
-    llm = ChatOllama(model=MODEL_NAME, temperature=0.2)
-    
-    # FIX 3: Expert Prompt (Explains instead of just copying)
-    prompt = ChatPromptTemplate.from_template("""
-    You are an expert analyst. Your goal is to provide a complete and detailed answer based on the provided context.
-    
-    Instructions:
-    1. Read the context below carefully.
-    2. Answer the question comprehensively. 
-    3. If the answer involves multiple points, list them.
-    4. Explain the "Why" and "How" if the text provides it.
-    5. Do not simply say "It is X". Say "It is X because..."
-    
-    If the answer is not in the context, strictly say "I cannot find the answer in the provided documents."
+def setup_rag_chain(vector_store):
+    """
+    Sets up the conversational chain with a custom persona and memory.
+    """
+    llm = ChatOllama(
+        model=MODEL_NAME,
+        temperature=0.3, # Keep it factual
+        base_url=BASE_URL
+    )
 
-    <context>
-    {context}
-    </context>
-
-    Question: {input}
-    """)
-
-    document_chain = create_stuff_documents_chain(llm, prompt)
+    # Custom System Prompt (The "Persona")
+    custom_template = """
+    You are a highly skilled Document Analysis AI. Your goal is to provide accurate, 
+    professional answers based ONLY on the provided context.
     
-    # FIX 4: Increased k=10 (Looks at more pages to find the needle in the haystack)
-    retriever = vector_store.as_retriever(search_kwargs={"k": 10})
-    return create_retrieval_chain(retriever, document_chain)
+    If the answer is not in the context, say "I cannot find that information in the documents."
+    Do not make up facts.
+    
+    Context: {context}
+    
+    Chat History: {chat_history}
+    User Question: {question}
+    
+    Answer:
+    """
+    
+    PROMPT = PromptTemplate(
+        input_variables=["context", "chat_history", "question"], 
+        template=custom_template
+    )
+
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        return_messages=True,
+        output_key='answer'
+    )
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=vector_store.as_retriever(search_kwargs={"k": 4}), # Retrieve top 4 chunks
+        memory=memory,
+        combine_docs_chain_kwargs={"prompt": PROMPT},
+        return_source_documents=True,
+        verbose=False
+    )
+    
+    return chain
 
 def main():
-    print("Initializing RAG Chatbot...")
+    console.clear()
+    console.rule("[bold blue]Local RAG Chatbot (CLI Version)[/bold blue]")
     
-    vector_store = create_or_load_vector_store()
+    # 1. Get Document Path
+    # Default is now set to 'source_docs' as requested
+    path_input = Prompt.ask("Enter path to your document or folder", default="source_docs")
+    
+    if not os.path.exists(path_input):
+        console.print(f"[bold red]Error: Path '{path_input}' does not exist.[/bold red]")
+        return
+
+    # 2. Find Files
+    files = get_files_from_directory(path_input)
+    if not files:
+        console.print("[bold red]No PDF/DOCX/TXT files found in that location.[/bold red]")
+        return
+    
+    console.print(f"[green]Found {len(files)} documents.[/green]")
+    
+    # 3. Build Brain
+    vector_store = process_documents(files)
     if not vector_store:
         return
 
-    retrieval_chain = get_rag_chain(vector_store)
+    # 4. Setup Chain
+    qa_chain = setup_rag_chain(vector_store)
+    console.rule("[bold green]Chat Ready! (Type 'exit' to quit)[/bold green]")
 
-    print("\n" + "="*50)
-    print("Chatbot Ready! Type 'exit' to stop.")
-    print("="*50 + "\n")
-
+    # 5. Chat Loop
     while True:
         try:
-            query = input("You: ")
-            if query.lower() in ["exit", "quit"]:
+            query = Prompt.ask("\n[bold cyan]You[/bold cyan]")
+            
+            if query.lower() in ["exit", "quit", "q"]:
+                console.print("[yellow]Goodbye![/yellow]")
                 break
             
             if not query.strip():
                 continue
 
-            print("Thinking...", end="\r")
-            response = retrieval_chain.invoke({"input": query})
+            with console.status("[bold yellow]Thinking...[/bold yellow]"):
+                start_time = time.time()
+                response = qa_chain.invoke({"question": query})
+                end_time = time.time()
+
+            # 6. Display Answer
+            answer = response['answer']
+            sources = response['source_documents']
             
-            print(f"\nAI: {response['answer']}\n")
+            # Print Markdown Answer
+            console.print(Panel(Markdown(answer), title="[bold green]AI Assistant[/bold green]", border_style="green"))
             
-            print("[Sources Used:]")
-            unique_pages = set()
-            # Show top 5 sources only to keep UI clean, even though we read 10
-            for doc in response.get("context", [])[:5]: 
-                page_num = doc.metadata.get('page', 'Unknown')
-                src = doc.metadata.get('source', 'Unknown')
-                unique_pages.add(f"{os.path.basename(src)} (Page {page_num})")
-            
-            for p in unique_pages:
-                print(f" - {p}")
-            print("-" * 50)
+            # Print Sources (Optional but useful for debugging)
+            unique_sources = set(doc.metadata.get('source', 'Unknown') for doc in sources)
+            console.print(f"[dim]Sources: {', '.join([os.path.basename(s) for s in unique_sources])} ({round(end_time - start_time, 2)}s)[/dim]")
 
         except KeyboardInterrupt:
+            print("\nGoodbye!")
             break
         except Exception as e:
-            print(f"Error: {e}")
+            console.print(f"[bold red]An error occurred: {e}[/bold red]")
 
 if __name__ == "__main__":
     main()
