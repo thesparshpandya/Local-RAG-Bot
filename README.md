@@ -98,7 +98,3 @@ python3 rag_bot.py
 * **Bot answers "I cannot find this information":** Try being more specific. While the bot has semantic expansion, extremely vague queries on large documents may still miss context.
 * **"Index mismatch":** If the bot behaves unexpectedly after changing files, manually delete the `faiss_index` folder to force a fresh rebuild.
 * **PDF Errors:** If a file fails to load, ensure it is a valid PDF (not an empty file or HTML error page) by opening it in a standard PDF viewer first.
-
-```
-
-```
