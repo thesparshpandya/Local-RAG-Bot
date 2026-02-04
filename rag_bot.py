@@ -5,11 +5,9 @@ import logging
 from typing import List
 
 # --- SILENCE CONFIGURATION ---
-# Silence LangChain and Unstructured logs
 logging.getLogger("langchain").setLevel(logging.ERROR)
 logging.getLogger("unstructured").setLevel(logging.ERROR)
 
-# Utility to silence C-level library noise (like PDF "Stroke Color" errors)
 class SuppressStderr:
     def __enter__(self):
         self._original_stderr = sys.stderr
@@ -18,33 +16,31 @@ class SuppressStderr:
         sys.stderr.close()
         sys.stderr = self._original_stderr
 
-# --- Rich Text Imports ---
 try:
     from rich.console import Console
     from rich.markdown import Markdown
     from rich.panel import Panel
     from rich.prompt import Prompt, Confirm
-    from rich.status import Status
     console = Console()
 except ImportError:
-    print("Tip: Install 'rich' for a better CLI experience (pip install rich)")
+    print("Tip: Install 'rich' for a better CLI experience")
     sys.exit(1)
 
-# --- LangChain Imports ---
 from langchain_community.document_loaders import UnstructuredFileLoader
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferWindowMemory
-from langchain.prompts import PromptTemplate
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.messages import HumanMessage, AIMessage
 
 # --- CONFIGURATION ---
 MODEL_NAME = "mistral"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 BASE_URL = "http://localhost:11434"
-DB_PATH = "faiss_index"  # Matches your folder structure
+DB_PATH = "faiss_index"
 
 def get_files_from_directory(path: str) -> List[str]:
     supported_exts = ['.pdf', '.docx', '.pptx', '.txt']
@@ -64,22 +60,20 @@ def get_embedding_model():
 
 def build_vector_store(file_paths: List[str]):
     all_docs = []
-    
-    with console.status("[bold green]Reading documents (Noise suppressed)...[/bold green]"):
-        # We wrap the loader in SuppressStderr to hide the "invalid float" errors
+    with console.status("[bold green]Reading documents...[/bold green]"):
         with SuppressStderr(): 
             for file_path in file_paths:
                 try:
                     loader = UnstructuredFileLoader(file_path, strategy="auto")
                     docs = loader.load()
                     all_docs.extend(docs)
-                except Exception:
-                    pass 
+                except Exception: pass 
 
     if not all_docs:
-        console.print("[bold red]No documents were successfully loaded.[/bold red]")
+        console.print("[bold red]No documents loaded.[/bold red]")
         return None
 
+    # Chunk size 1000 ensures specific financial figures aren't cut in half
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = text_splitter.split_documents(all_docs)
     console.print(f"[blue]Processed {len(chunks)} text chunks.[/blue]")
@@ -88,109 +82,116 @@ def build_vector_store(file_paths: List[str]):
         embeddings = get_embedding_model()
         vector_store = FAISS.from_documents(chunks, embeddings)
         vector_store.save_local(DB_PATH)
-        console.print(f"[green]Brain saved to local folder: '{DB_PATH}'[/green]")
     
     return vector_store
 
 def load_vector_store():
     embeddings = get_embedding_model()
     try:
-        vector_store = FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
-        console.print(f"[green]Successfully loaded saved brain from '{DB_PATH}'[/green]")
-        return vector_store
-    except Exception as e:
-        console.print(f"[red]Could not load saved data: {e}[/red]")
-        return None
+        return FAISS.load_local(DB_PATH, embeddings, allow_dangerous_deserialization=True)
+    except Exception: return None
 
 def setup_rag_chain(vector_store):
-    llm = ChatOllama(model=MODEL_NAME, temperature=0.3, base_url=BASE_URL)
+    llm = ChatOllama(model=MODEL_NAME, temperature=0, base_url=BASE_URL)
 
-    # --- SMARTER PROMPT ---
-    custom_template = """
-    You are a smart AI assistant. Follow these rules strictly:
+    # Retriever (k=12 covers enough ground for specific financial details)
+    retriever = vector_store.as_retriever(search_kwargs={"k": 12})
+
+    # --- THE FIX: QUERY EXPANSION PROMPT ---
+    # We now teach the bot that "reasons" == "led by" == "drivers"
+    contextualize_q_system_prompt = """You are a smart Search Optimizer.
+    Task: Rewrite the user's question to be more effective for searching a financial document.
     
-    1. If the user says "hi", "hello", "yo", or greets you, simply reply back politely. DO NOT use the context.
-    2. If the user asks a question, answer it using ONLY the provided Context.
-    3. If the answer is not in the Context, say "I cannot find that information in the documents."
-    
-    Context: {context}
-    Chat History: {chat_history}
-    User Input: {question}
-    
-    Answer:
+    RULES:
+    1. Expand Synonyms: If user asks for "reasons", include words like "drivers", "factors", "led by", "caused by".
+       - Example: "Reasons for margin" -> "What factors, drivers, or specific items led to the margin performance?"
+    2. Maintain Context: If the user refers to "it" or "this", replace with the specific topic from history.
+    3. Simplicity: If the question is simple (e.g., "Who is CEO?"), keep it simple.
     """
     
-    PROMPT = PromptTemplate(
-        input_variables=["context", "chat_history", "question"], 
-        template=custom_template
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        ("system", contextualize_q_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
+    
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
     )
 
-    memory = ConversationBufferWindowMemory(
-        k=5,
-        memory_key="chat_history",
-        return_messages=True,
-        output_key='answer'
-    )
-
-    return ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vector_store.as_retriever(search_kwargs={"k": 4}),
-        memory=memory,
-        combine_docs_chain_kwargs={"prompt": PROMPT},
-        return_source_documents=True,
-        verbose=False
-    )
+    # --- ANSWER PROMPT ---
+    qa_system_prompt = """You are an expert Financial Analyst AI.
+    Use the provided context to answer the user's question.
+    
+    STRICT RULES:
+    1. Semantics: Understand that "reasons for" usually refers to "what led to" or "drivers of" a metric.
+    2. Precision: Quote specific numbers (e.g. "24.6%") if found.
+    3. Honesty: If the answer is truly missing, say "I cannot find this information."
+    
+    Context:
+    {context}"""
+    
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system", qa_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
+    
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    return rag_chain
 
 def main():
     console.clear()
-    console.rule("[bold blue]Local RAG Chatbot v2.0 (Persistent)[/bold blue]")
+    console.rule("[bold blue]Local RAG Bot v4.1 (Semantic Fix)[/bold blue]")
     
     vector_store = None
-    
-    # Check for existing DB (matches your 'faiss_index' folder)
-    if os.path.exists(DB_PATH):
-        if Confirm.ask(f"Found saved data in '{DB_PATH}'. Load it?", default=True):
-            vector_store = load_vector_store()
+    if os.path.exists(DB_PATH) and Confirm.ask(f"Load saved data from '{DB_PATH}'?", default=True):
+        vector_store = load_vector_store()
     
     if not vector_store:
-        # Default matches your 'source_docs' folder
-        path_input = Prompt.ask("Enter path to your document or folder", default="source_docs")
-        if not os.path.exists(path_input):
-            console.print(f"[red]Path not found.[/red]")
-            return
+        path_input = Prompt.ask("Enter source folder", default="source_docs")
+        if not os.path.exists(path_input): return
         files = get_files_from_directory(path_input)
         vector_store = build_vector_store(files)
 
     if not vector_store: return
 
-    qa_chain = setup_rag_chain(vector_store)
-    console.rule("[bold green]Chat Ready! (Type 'exit' to quit)[/bold green]")
+    rag_chain = setup_rag_chain(vector_store)
+    chat_history = [] 
+
+    console.rule("[bold green]Chat Ready![/bold green]")
 
     while True:
         query = Prompt.ask("\n[bold cyan]You[/bold cyan]")
         
-        # Check exit BEFORE sending to LLM
-        if query.lower() in ["exit", "quit", "q"]: 
+        # --- GUARDRAIL 1: Instant Exit ---
+        if query.lower() in ["exit", "q", "quit"]: 
             console.print("[yellow]Goodbye![/yellow]")
             break
+        
+        # --- GUARDRAIL 2: Instant Chitchat ---
+        greetings = ["hi", "hello", "hey", "yo", "morning", "evening"]
+        if query.lower().strip() in greetings:
+            console.print(Panel("Hello! How can I help you with your documents today?", title="AI Assistant", border_style="green"))
+            continue
             
         if not query.strip(): continue
 
         with console.status("[bold yellow]Thinking...[/bold yellow]"):
             t0 = time.time()
-            res = qa_chain.invoke({"question": query})
+            result = rag_chain.invoke({"input": query, "chat_history": chat_history})
             t1 = time.time()
 
-        answer = res['answer']
-        # Handle sources gracefully (if they exist)
-        if 'source_documents' in res:
-            sources = list(set([os.path.basename(doc.metadata.get('source', 'Unknown')) for doc in res['source_documents']]))
-            source_text = f"Sources: {sources}"
-        else:
-            source_text = "No sources used (Chitchat)"
-
+        answer = result["answer"]
+        sources = list(set([os.path.basename(doc.metadata.get('source', 'Unknown')) for doc in result['context']]))
+        
         console.print(Panel(Markdown(answer), title="AI Assistant", border_style="green"))
-        console.print(f"[dim]{source_text} ({round(t1-t0, 2)}s)[/dim]")
+        console.print(f"[dim]Sources: {sources} ({round(t1-t0, 2)}s)[/dim]")
+        
+        chat_history.append(HumanMessage(content=query))
+        chat_history.append(AIMessage(content=answer))
+        if len(chat_history) > 6: chat_history = chat_history[-6:]
 
 if __name__ == "__main__":
     main()
