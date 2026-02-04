@@ -1,6 +1,3 @@
-Here is your updated `README.md`. I have preserved your exact formatting while injecting the new "Gold Edition" features (Semantic Rewriting, Guardrails, Deep Context) into the relevant sections.
-
-```markdown
 # Local RAG Chatbot
 
 A private, local Retrieval-Augmented Generation (RAG) chatbot that allows you to chat with your PDF documents.
