@@ -7,6 +7,7 @@ from typing import List
 # --- SILENCE CONFIGURATION ---
 logging.getLogger("langchain").setLevel(logging.ERROR)
 logging.getLogger("unstructured").setLevel(logging.ERROR)
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 
 class SuppressStderr:
     def __enter__(self):
@@ -36,9 +37,15 @@ from langchain.chains import create_history_aware_retriever, create_retrieval_ch
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.messages import HumanMessage, AIMessage
 
+# --- NEW RERANKING IMPORTS ---
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+
 # --- CONFIGURATION ---
 MODEL_NAME = "mistral"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+RERANKER_MODEL = "BAAI/bge-reranker-base"
 BASE_URL = "http://localhost:11434"
 DB_PATH = "faiss_index"
 
@@ -73,10 +80,10 @@ def build_vector_store(file_paths: List[str]):
         console.print("[bold red]No documents loaded.[/bold red]")
         return None
 
-    # Chunk size 1000 ensures specific financial figures aren't cut in half
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    # V13/V14 settings: 1000 size / 500 overlap guarantees context retention.
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=500)
     chunks = text_splitter.split_documents(all_docs)
-    console.print(f"[blue]Processed {len(chunks)} text chunks.[/blue]")
+    console.print(f"[blue]Processed {len(chunks)} overlapping chunks.[/blue]")
 
     with console.status("[bold green]Embedding data...[/bold green]"):
         embeddings = get_embedding_model()
@@ -93,20 +100,31 @@ def load_vector_store():
 
 def setup_rag_chain(vector_store):
     llm = ChatOllama(model=MODEL_NAME, temperature=0, base_url=BASE_URL)
+    
+    # --- STAGE 1: BROAD SEARCH ---
+    # Fetch top 25 chunks instantly using vector similarity.
+    base_retriever = vector_store.as_retriever(search_kwargs={"k": 25})
 
-    # Retriever (k=12 covers enough ground for specific financial details)
-    retriever = vector_store.as_retriever(search_kwargs={"k": 12})
+    # --- STAGE 2: RERANKING ---
+    # Cross-Encoder reads the 25 chunks against the query word-for-word and keeps the top 5.
+    reranker_model = HuggingFaceCrossEncoder(model_name=RERANKER_MODEL)
+    compressor = CrossEncoderReranker(model=reranker_model, top_n=5)
+    
+    compression_retriever = ContextualCompressionRetriever(
+        base_compressor=compressor, 
+        base_retriever=base_retriever
+    )
 
-    # --- THE FIX: QUERY EXPANSION PROMPT ---
-    # We now teach the bot that "reasons" == "led by" == "drivers"
-    contextualize_q_system_prompt = """You are a smart Search Optimizer.
-    Task: Rewrite the user's question to be more effective for searching a financial document.
+    # --- REWRITER PROMPT ---
+    contextualize_q_system_prompt = """You are a Search Logic Expert.
+    Task: Rewrite the user's question to be specific and keyword-rich.
     
     RULES:
-    1. Expand Synonyms: If user asks for "reasons", include words like "drivers", "factors", "led by", "caused by".
-       - Example: "Reasons for margin" -> "What factors, drivers, or specific items led to the margin performance?"
-    2. Maintain Context: If the user refers to "it" or "this", replace with the specific topic from history.
-    3. Simplicity: If the question is simple (e.g., "Who is CEO?"), keep it simple.
+    1. Resolve Pronouns: "Calculate it" -> "Calculate [Previous Topic]".
+    2. Expand Synonyms: "Reasons" -> "Drivers, Led by, Due to".
+    3. Target Specifics: If user asks for numbers, add "Table" or "Financials" to the query.
+    
+    Return ONLY the rewritten query.
     """
     
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
@@ -115,18 +133,23 @@ def setup_rag_chain(vector_store):
         ("human", "{input}"),
     ])
     
+    # Connect the rewriter to the COMPRESSION retriever, not the base retriever.
     history_aware_retriever = create_history_aware_retriever(
-        llm, retriever, contextualize_q_prompt
+        llm, compression_retriever, contextualize_q_prompt
     )
 
-    # --- ANSWER PROMPT ---
-    qa_system_prompt = """You are an expert Financial Analyst AI.
-    Use the provided context to answer the user's question.
+    # --- FINAL ANSWER PROMPT ---
+    qa_system_prompt = """You are an Expert Financial Auditor Assistant.
+    Answer using ONLY the provided context.
     
-    STRICT RULES:
-    1. Semantics: Understand that "reasons for" usually refers to "what led to" or "drivers of" a metric.
-    2. Precision: Quote specific numbers (e.g. "24.6%") if found.
-    3. Honesty: If the answer is truly missing, say "I cannot find this information."
+    READING RULES:
+    1. TABLE PATTERNS: In text-based PDF tables, the Label is often followed immediately by the Number.
+       - "EBIT 24.6" means EBIT is 24.6%.
+       - "Profit 19.3" means Profit is 19.3%.
+    2. TEXT EXPLANATIONS: Look for sentences explaining numbers (e.g., "margin improvement was led by..."). 
+    3. HONESTY: 
+       - If asked to count words: Refuse ("I cannot count words globally").
+       - If asked to calculate: Only do it if you see the raw numbers (Revenue, Count, etc). If missing, say "Missing raw data."
     
     Context:
     {context}"""
@@ -143,7 +166,7 @@ def setup_rag_chain(vector_store):
 
 def main():
     console.clear()
-    console.rule("[bold blue]Local RAG Bot v4.1 (Semantic Fix)[/bold blue]")
+    console.rule("[bold blue]Local RAG Bot - Retrieve & Rerank Edition[/bold blue]")
     
     vector_store = None
     if os.path.exists(DB_PATH) and Confirm.ask(f"Load saved data from '{DB_PATH}'?", default=True):
@@ -157,7 +180,10 @@ def main():
 
     if not vector_store: return
 
-    rag_chain = setup_rag_chain(vector_store)
+    # Setup chain (this may take a few seconds on first run to load the reranker model)
+    with console.status("[bold green]Initializing Retriever & Cross-Encoder...[/bold green]"):
+        rag_chain = setup_rag_chain(vector_store)
+        
     chat_history = [] 
 
     console.rule("[bold green]Chat Ready![/bold green]")
@@ -165,25 +191,24 @@ def main():
     while True:
         query = Prompt.ask("\n[bold cyan]You[/bold cyan]")
         
-        # --- GUARDRAIL 1: Instant Exit ---
         if query.lower() in ["exit", "q", "quit"]: 
             console.print("[yellow]Goodbye![/yellow]")
             break
         
-        # --- GUARDRAIL 2: Instant Chitchat ---
-        greetings = ["hi", "hello", "hey", "yo", "morning", "evening"]
+        greetings = ["hi", "hello", "hey", "yo", "morning"]
         if query.lower().strip() in greetings:
-            console.print(Panel("Hello! How can I help you with your documents today?", title="AI Assistant", border_style="green"))
+            console.print(Panel("Hello! Ready to analyze your documents with high precision.", title="AI Assistant", border_style="green"))
             continue
             
         if not query.strip(): continue
 
-        with console.status("[bold yellow]Thinking...[/bold yellow]"):
+        with console.status("[bold yellow]Retrieving, Reranking & Generating...[/bold yellow]"):
             t0 = time.time()
             result = rag_chain.invoke({"input": query, "chat_history": chat_history})
             t1 = time.time()
 
         answer = result["answer"]
+        # In a compressed retriever, the final 'context' only contains the top_n chunks that passed the reranker.
         sources = list(set([os.path.basename(doc.metadata.get('source', 'Unknown')) for doc in result['context']]))
         
         console.print(Panel(Markdown(answer), title="AI Assistant", border_style="green"))
